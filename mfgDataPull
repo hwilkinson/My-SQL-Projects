@@ -1,0 +1,15 @@
+SELECT
+       mfg_facility_no AS Fab
+       ,RTRIM(design_id) AS design_id
+       ,year_ww
+       ,DPW_max_qty
+       ,die_shipped_qty/CAST(wafer_total_outs_qty AS float) AS DPW_qty
+       ,CASE WHEN DPW_max_qty>0 THEN (die_shipped_qty/CAST(wafer_total_outs_qty AS float))/CAST(DPW_max_qty AS float) ELSE NULL END AS 'Probe Yield'
+       ,lot_shipped_yld_pct AS 'Line Yield'
+       ,wafer_total_outs_qty AS 'Probe Wafer Outs'
+       ,die_shipped_qty AS 'Die'
+       ,wafer_start_qty
+
+FROM ourDB..mfg_history
+WHERE wafer_total_outs_qty>0
+ORDER BY mfg_facility_no,design_id,year_ww
