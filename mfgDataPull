@@ -10,6 +10,6 @@ SELECT
        ,die_shipped_qty AS 'Die'
        ,wafer_start_qty
 
-FROM ourDB..mfg_history
+FROM ourDB.mfg_history
 WHERE wafer_total_outs_qty>0
 ORDER BY mfg_facility_no,design_id,year_ww
