@@ -1,0 +1,242 @@
+// Stage the file into temporary storage.
+
+put
+file:///Users/heathwilkinson/Downloads/FLEET_Production/190222-DPM-SPM-Assignments-Sheet1.csv
+@fleet.fleet
+auto_compress=false;
+
+// Clear the previous data from the table.
+TRUNCATE d_performance.t_dspm;
+
+// Copy the contents of the file into the truncated table. 
+COPY INTO d_performance.t_dspm
+          (eid
+          ,full_name
+          ,roc_id
+          ,assignment_start
+          ,assignment_end
+          )
+FROM @fleet/190222-DPM-SPM-Assignments-Sheet1.csv
+FILE_FORMAT = (FORMAT_NAME = 'CSV_LD_1_LINE')
+ON_ERROR    = CONTINUE
+PURGE       = TRUE;
+
+// Additional SQL to update other related data.
+INSERT INTO d_performance.t_achieve_performance_data_V2
+SELECT DISTINCT wo_ww, tech_id, technician, role_type, scheduled, comm_wos, comm_fixes, sct_other_wos, sct_other_fixes, gen_wos, gen_fixes, spt_other_wos, spt_other_fixes, hire_date, total_workhours, workhours, dnf,
+     // Calculate performance metrics based on technician title.
+            CASE WHEN (role_type = 'SCT' AND total_workhours > 34.9 AND (comm_wos + gen_wos + sct_other_wos + spt_other_wos) > 9) THEN CAST(NVL(total_workhours/NULLIF(comm_fixes, 0) * dnf, total_workhours) AS decimal(4,2)) END AS mrrtn,
+            CASE WHEN (role_type = 'SPT' AND total_workhours > 34.9 AND (comm_wos + gen_wos + sct_other_wos + spt_other_wos) > 9) THEN CAST(NVL((gen_fixes / NULLIF(gen_wos, 0) * .7), 0) + NVL((spt_other_fixes / NULLIF(spt_other_wos, 0) * .3), 0) AS decimal(4,2)) END AS tsr,
+     // Flag anyone who hasn't worked the minimum hours or completed the minimum workorders.
+            CASE
+                WHEN scheduled < 10 THEN 'Workorders'
+                WHEN total_workhours < 35 THEN 'Hours'
+                ELSE 'None'
+            END AS exclusion,
+     // Clean up the offices that are not properly assigned.            
+            CASE
+                WHEN roc = 'UT-02' THEN 'UT-01'
+                WHEN roc = 'NY-02' THEN 'NY-01'
+                WHEN roc = 'HI-02' OR roc = 'HI-03' THEN 'HI-01'
+                WHEN roc = 'MD-03' THEN 'MD-01'
+                WHEN roc = 'FL-02' AND technician = 'Robert Johnson' THEN 'SC-01'
+                ELSE roc
+            END AS roc_name,
+     // Set the flags for technician type.
+            CASE WHEN role_type = 'SCT' THEN 1 END AS sct_cnt,
+            CASE WHEN role_type = 'SPT' THEN 1 END AS spt_cnt,
+     // Calculate metric dependent on technician type.            
+            CASE WHEN (role_type = 'SCT' AND total_workhours > 34.9 AND (comm_wos + gen_wos + sct_other_wos + spt_other_wos) > 9) THEN CAST(1-(PERCENT_RANK() OVER (PARTITION BY wo_ww,role_type='SCT' ORDER BY mrrtn ASC)) AS decimal(4,2)) END AS sct_pctrank,
+            CASE WHEN (role_type = 'SPT' AND total_workhours > 34.9 AND (comm_wos + gen_wos + sct_other_wos + spt_other_wos) > 9) THEN CAST((PERCENT_RANK() OVER (PARTITION BY wo_ww,role_type='SPT' ORDER BY tsr ASC)) AS decimal(4,2)) END AS spt_pctrank,
+            TERMINATED,
+            d.full_name AS spm,
+            d.eid AS spm_badge,
+            e.spm_hiredate,
+     // Calculate the SPMS metrics.
+            CAST(NVL((gen_spms_fixes / NULLIF(gen_cnt_spms, 0) * .66), 0) + NVL((com_spms_fixes / NULLIF(com_cnt_spms, 0) * .34), 0) AS decimal(4,2)) AS spms,
+            CURRENT_TIMESTAMP() AS last_refreshed
+
+      FROM (
+           // Gather workorder data.
+      (SELECT DATE_TRUNC('Week', wo_date) AS wo_ww, tech_id, technician, role_type, COUNT(issue_status_at_appt) AS scheduled,                            //SUM(valid_schedule) AS scheduled,  ................ editted 10-Apr-2019 per Steve Littlefield pending review with Analytics team.
+           COUNT(CASE WHEN role_type = 'SCT' AND issue_status_at_appt LIKE 'COMM%' THEN 1 END) AS comm_wos,
+           COUNT(CASE WHEN role_type = 'SCT' AND issue_status_at_appt LIKE 'COMM%' AND fix = 1 THEN 1 END) AS comm_fixes,
+           COUNT(CASE WHEN role_type = 'SCT' AND issue_status_at_appt NOT LIKE 'COMM%' THEN 1 END) AS sct_other_wos,
+           COUNT(CASE WHEN role_type = 'SCT' AND issue_status_at_appt NOT LIKE 'COMM%' AND fix = 1 THEN 1 END) AS sct_other_fixes,
+
+           COUNT(CASE WHEN role_type = 'SPT' AND issue_status_at_appt LIKE 'GEN%' THEN 1 END) AS gen_wos,
+           COUNT(CASE WHEN role_type = 'SPT' AND issue_status_at_appt LIKE 'GEN%' AND fix = 1 THEN 1 END) AS gen_fixes,
+           COUNT(CASE WHEN role_type = 'SPT' AND issue_status_at_appt NOT LIKE 'GEN%' THEN 1 END) AS spt_other_wos,
+           COUNT(CASE WHEN role_type = 'SPT' AND issue_status_at_appt NOT LIKE 'GEN%' AND fix = 1 THEN 1 END) AS spt_other_fixes,
+
+           COUNT(CASE WHEN issue_status_at_appt LIKE 'GEN%' THEN 1 END) AS gen_cnt_spms,
+           COUNT(CASE WHEN issue_status_at_appt LIKE 'GEN%' AND fix = 1 THEN 1 END) AS gen_spms_fixes,
+           COUNT(CASE WHEN issue_status_at_appt LIKE 'COM%' THEN 1 END) AS com_cnt_spms,
+           COUNT(CASE WHEN issue_status_at_appt LIKE 'COM%' AND fix = 1 THEN 1 END) AS com_spms_fixes
+
+              FROM d_performance.v_jobs
+              WHERE trend = 'WEEKLY'
+              AND role_type IN ('SCT', 'SPT')
+              AND fix_data_avlbl = 'Y'
+                     // AND valid_schedule = 1 ___________ removed 10-Apr-2019 per Steve Littlefield pending review with Analytics team.
+              GROUP BY DATE_TRUNC('Week', wo_date), tech_id, technician, role_type
+              ORDER BY wo_ww, tech_id) a
+      LEFT JOIN
+           // Gather time and employee data.
+      (SELECT hr.employee_id, date_trunc('Week', hr.reported_date) AS hrs_ww, he.hire_date, LEFT(he.business_site_name, 5) AS ROC, he.terminated,
+                          SUM(CASE WHEN hr.calculation_tags = 'Paid Holiday' THEN hr.total_hours ELSE 0 END) AS holiday_hours,
+                          SUM(hr.total_hours) - holiday_hours AS workhours,
+                          SUM(CASE WHEN hr.source = 'System Generated' AND hr.calculation_tags != 'Paid Holiday' THEN hr.total_hours ELSE 0 END) AS subtract_workhours,
+                          CAST((workhours - subtract_workhours) AS decimal(4,2)) AS total_workhours
+              FROM hr.v_time hr, hr.t_employee he
+              WHERE hr.reported_date > date_trunc('Week', CURRENT_DATE()) - 7
+              AND he.badge_id = hr.employee_id
+              GROUP BY hr.employee_id, date_trunc('Week', hr.reported_date), he.hire_date, LEFT(he.business_site_name, 5), he.terminated) b
+      ON b.employee_id = a.tech_id AND b.hrs_ww = a.wo_ww
+      LEFT JOIN
+     // Calculate Com normalization factor and align with field office.
+              (WITH t AS (SELECT roc_name,
+                COUNT(*) AS TOTAL
+                FROM D_PERFORMANCE.V_FLEET_STATUS_V2 AS p
+                WHERE p.IS_CURRENT = 1
+                AND p.ISSUE_STATUS != 'No Known Issue'
+                AND p.ISSUE_STATUS LIKE ('Communication%')
+                AND p.WORKABLE_STATUS = 'WORKABLE'
+                GROUP BY p.ROC_NAME, p.PROJECT_ID)
+
+              (SELECT t.ROC_NAME,
+                SUM(TOTAL) AS Comms, at.pj, (SUM(TOTAL)/at.pj) AS perc_comms,
+                CAST((0.50 + (5 * (CASE WHEN perc_comms > .10 THEN .10 ELSE perc_comms END))) AS decimal(4, 2)) AS dnf
+                FROM t,
+                      (SELECT count(distinct project_id) AS pj, roc_name
+                       FROM D_PERFORMANCE.V_FLEET_STATUS_V2
+                       WHERE IS_CURRENT = 1
+                       GROUP BY roc_name) at
+                WHERE at.roc_name = t.roc_name
+                GROUP BY t.ROC_NAME, at.pj)) c
+      ON LEFT(c.roc_name, 5) = b.roc
+      LEFT JOIN
+              (SELECT roc_id, full_name, eid
+              FROM d_performance.t_dspm) d
+      ON d.roc_id = b.roc
+      LEFT JOIN
+              (SELECT hire_date AS spm_hiredate, employee_id
+              FROM hr.t_employee) e
+      ON e.employee_id = d.eid
+
+
+      )
+      WHERE wo_ww BETWEEN '2019-01-07' AND dateadd('Day', -1, date_trunc('Week', CURRENT_DATE))
+      ORDER BY wo_ww, technician;
+
+
+INSERT INTO d_performance.t_achieve_V2
+WITH CTE_LW AS (
+            SELECT ta.badge_id, s2.full_name, ta.role_type, ta.wo_ww, ta.gtsr AS prev_tsr, ta.tmp_rnk AS prev_rank, ta.tier AS prev_tier
+            FROM d_performance.t_achieve_V2 ta,
+                            (SELECT DISTINCT full_name, MAX(wo_ww) AS max_ww
+                            FROM d_performance.t_achieve_V2 ta
+                            WHERE tier IS NOT NULL
+                            GROUP BY full_name) s2
+            WHERE ta.wo_ww = s2.max_ww
+            AND ta.full_name = s2.full_name
+            GROUP BY s2.full_name, ta.tmp_rnk, ta.tier, ta.wo_ww, ta.badge_id, ta.role_type, ta.gtsr
+                ),
+
+     CTE_SPM_TW AS (
+       SELECT DISTINCT spm_badge AS badge_id, spm AS full_name, 'SPM' AS role_type, wo_ww, AVG(spms) AS gtsr,
+         CAST((CUME_DIST() OVER (PARTITION BY wo_ww ORDER BY gtsr ASC)) AS decimal(4,2)) AS tmp_rnk,
+         CASE WHEN eb.prev_rank = '0' AND eb.prev_tier = '0' AND eb.prev_tsr='0' THEN 1 ELSE  // NOT EXISTS (SELECT * FROM d_performance.t_achieve_v2 WHERE badge_id = spm_badge) THEN 1 ELSE
+
+              CASE
+                  WHEN spm_hiredate BETWEEN dateadd('Week', -4, to_date(date_trunc('Week', CURRENT_DATE()))) AND to_date(date_trunc('Week', CURRENT_DATE())) THEN 1
+                  WHEN gtsr = 0 AND eb.prev_rank IS NOT NULL THEN GREATEST((eb.prev_tier - 1), 0)
+
+                  WHEN (eb.prev_rank > .74) AND (tmp_rnk > .74) THEN LEAST((eb.prev_tier + 1), 10)
+                  WHEN (eb.prev_rank > .74) AND (tmp_rnk BETWEEN .26 AND .74) THEN GREATEST((eb.prev_tier - 1), 1)
+                  WHEN (eb.prev_rank > .74) AND (tmp_rnk < .26) THEN GREATEST((eb.prev_tier - 1), 0)
+
+                  WHEN (eb.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk > .74) THEN LEAST((eb.prev_tier + 1), 10)
+                  WHEN (eb.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk BETWEEN .26 AND .74) THEN GREATEST((eb.prev_tier - 1), 1)
+                  WHEN (eb.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk < .26) THEN GREATEST((eb.prev_tier - 1), 0)
+
+                  WHEN (eb.prev_rank < .26 AND tmp_rnk < .26) THEN GREATEST((eb.prev_tier - 1), 0)
+                  WHEN (eb.prev_rank < .26 AND tmp_rnk > .25) THEN LEAST((eb.prev_tier + 1), 10)
+               END
+
+         END AS tier
+
+          FROM d_performance.t_achieve_performance_data_V2,
+                            (SELECT prev_rank, prev_tier, badge_id, prev_tsr FROM CTE_LW WHERE role_type = 'SPM') eb
+          WHERE eb.badge_id = spm_badge
+          AND wo_ww = dateadd('Week', -1, date_trunc('Week', CURRENT_DATE))
+          AND spms IS NOT NULL
+          GROUP BY spm_badge, spm, wo_ww, spm_hiredate, eb.badge_id, eb.prev_rank, eb.prev_tier, eb.prev_tsr
+          ORDER BY spm
+                    ),
+
+     CTE_SPT_TW AS (
+            SELECT DISTINCT et.tech_id AS badge_id, et.technician AS full_name, et.role_type, et.wo_ww, et.tsr,
+            CAST((CUME_DIST() OVER (PARTITION BY et.wo_ww ORDER BY et.tsr ASC)) AS decimal(4,2)) AS tmp_rnk,    //, et.roc_name AS roc
+            CASE
+                WHEN f.prev_rank = '0' AND f.prev_tier = '0' AND f.prev_tsr='0' THEN 1  //NOT EXISTS (SELECT * FROM d_performance.t_achieve_v2 WHERE badge_id = et.tech_id) THEN 1
+                WHEN et.hire_date BETWEEN dateadd('Week', -4, to_date(date_trunc('Week', CURRENT_DATE()))) AND to_date(date_trunc('Week', CURRENT_DATE())) THEN 1
+                WHEN et.tsr = 0 AND f.prev_rank IS NOT NULL THEN GREATEST((f.prev_tier - 1), 0)
+
+                WHEN (f.prev_rank > .74) AND (tmp_rnk > .74) THEN LEAST((f.prev_tier + 1), 10)
+                WHEN (f.prev_rank > .74) AND (tmp_rnk BETWEEN .26 AND .74) THEN GREATEST((f.prev_tier - 1), 1)
+                WHEN (f.prev_rank > .74) AND (tmp_rnk < .26) THEN GREATEST((f.prev_tier - 1), 0)
+
+                WHEN (f.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk > .74) THEN LEAST((f.prev_tier + 1), 10)
+                WHEN (f.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk BETWEEN .26 AND .74) THEN GREATEST((f.prev_tier - 1), 1)
+                WHEN (f.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk < .26) THEN GREATEST((f.prev_tier - 1), 0)
+
+                WHEN (f.prev_rank < .26 AND tmp_rnk < .26) THEN GREATEST((f.prev_tier - 1), 0)
+                WHEN (f.prev_rank < .26 AND tmp_rnk > .25) THEN LEAST((f.prev_tier + 1), 10)
+            END AS tier
+
+            FROM d_performance.t_achieve_performance_data_v2 et, (SELECT prev_rank, prev_tier, badge_id, prev_tsr FROM CTE_LW WHERE role_type = 'SPT' ) f
+            WHERE et.role_type = 'SPT'
+            AND f.badge_id = et.tech_id
+            AND et.tsr IS NOT NULL
+            AND et.wo_ww = dateadd('Week', -1, date_trunc('Week', CURRENT_DATE))
+            GROUP BY et.tech_id, et.technician, et.role_type, et.wo_ww, et.tsr, et.hire_date, f.prev_rank, f.prev_tier, f.prev_tsr
+                    ),
+
+     CTE_SCT_TW AS (
+            SELECT er.tech_id AS badge_id, er.technician AS full_name, er.role_type, er.wo_ww, er.mrrtn AS tsr,
+            CAST(1 - (CUME_DIST() OVER (PARTITION BY er.wo_ww ORDER BY er.mrrtn ASC)) AS decimal(4,2)) AS tmp_rnk,    //, et.roc_name AS roc
+            CASE
+                WHEN g.prev_rank = '0' AND g.prev_tier = '0' AND g.prev_tsr='0' THEN 1     //NOT EXISTS (SELECT * FROM d_performance.t_achieve_v2 WHERE badge_id = er.tech_id) THEN 1
+                WHEN er.hire_date BETWEEN dateadd('Week', -4, to_date(date_trunc('Week', CURRENT_DATE()))) AND to_date(date_trunc('Week', CURRENT_DATE())) THEN 1
+                WHEN er.mrrtn = 0 AND g.prev_rank IS NOT NULL THEN GREATEST((g.prev_tier - 1), 0)
+
+                WHEN (g.prev_rank > .74) AND (tmp_rnk > .74) THEN LEAST((g.prev_tier + 1), 10)
+                WHEN (g.prev_rank > .74) AND (tmp_rnk BETWEEN .26 AND .74) THEN GREATEST((g.prev_tier - 1), 1)
+                WHEN (g.prev_rank > .74) AND (tmp_rnk < .26) THEN GREATEST((g.prev_tier - 1), 0)
+
+                WHEN (g.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk > .74) THEN LEAST((g.prev_tier + 1), 10)
+                WHEN (g.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk BETWEEN .26 AND .74) THEN GREATEST((g.prev_tier - 1), 1)
+                WHEN (g.prev_rank BETWEEN .26 AND .74) AND (tmp_rnk < .26) THEN GREATEST((g.prev_tier - 1), 0)
+
+                WHEN (g.prev_rank < .26 AND tmp_rnk < .26) THEN GREATEST((g.prev_tier - 1), 0)
+                WHEN (g.prev_rank < .26 AND tmp_rnk > .25) THEN LEAST((g.prev_tier + 1), 10)
+            END AS tier
+
+            FROM d_performance.t_achieve_performance_data_v2 er, (SELECT prev_rank, prev_tier, badge_id, prev_tsr FROM CTE_LW WHERE role_type LIKE 'SCT' ) g
+            WHERE er.role_type = 'SCT'
+            AND g.badge_id = er.tech_id
+            AND er.mrrtn IS NOT NULL
+            AND er.wo_ww = dateadd('Week', -1, date_trunc('Week', CURRENT_DATE))
+            GROUP BY er.tech_id, er.technician, er.role_type, er.wo_ww, er.mrrtn, er.hire_date, g.prev_rank, g.prev_tier, g.prev_tsr
+                    )
+SELECT *
+FROM
+    (SELECT *
+     FROM CTE_SPM_TW)
+UNION
+    (SELECT *
+     FROM CTE_SPT_TW)
+UNION
+    (SELECT *
+     FROM CTE_SCT_TW);
